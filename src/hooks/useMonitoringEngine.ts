@@ -3,389 +3,513 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { MonitoringEngine, MonitoringEvent, PostureState } from "@/types";
 import { createFaceLandmarker, createPoseLandmarker } from "@/lib/vision/mediapipe";
-import { computeLeanState, computeSlouch, faceAreaSignal } from "@/lib/posture/heuristics";
+import { faceAreaSignal } from "@/lib/posture/heuristics";
 
 type Options = {
-    enableFace?: boolean;
-    fpsCap?: number;
-    drawDebug?: boolean; // draw landmarks overlay for debugging
+  enableFace?: boolean;
+  fpsCap?: number;
+  drawDebug?: boolean;
+  mirror?: boolean; // ✅ true if your preview is mirrored (selfie style)
 };
 
+// ---------- drawing helpers ----------
 function drawLine(
-    ctx: CanvasRenderingContext2D,
-    a: { x: number; y: number } | undefined,
-    b: { x: number; y: number } | undefined,
-    w: number,
-    h: number
+  ctx: CanvasRenderingContext2D,
+  a: { x: number; y: number } | undefined,
+  b: { x: number; y: number } | undefined,
+  w: number,
+  h: number
 ) {
-    if (!a || !b) return;
-    ctx.beginPath();
-    ctx.moveTo(a.x * w, a.y * h);
-    ctx.lineTo(b.x * w, b.y * h);
-    ctx.stroke();
+  if (!a || !b) return;
+  ctx.beginPath();
+  ctx.moveTo(a.x * w, a.y * h);
+  ctx.lineTo(b.x * w, b.y * h);
+  ctx.stroke();
 }
 
 function ensureCanvasMatchesVideo(video: HTMLVideoElement, canvas: HTMLCanvasElement) {
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
-    if (!vw || !vh) return;
-    if (canvas.width !== vw) canvas.width = vw;
-    if (canvas.height !== vh) canvas.height = vh;
+  const vw = video.videoWidth;
+  const vh = video.videoHeight;
+  if (!vw || !vh) return;
+  if (canvas.width !== vw) canvas.width = vw;
+  if (canvas.height !== vh) canvas.height = vh;
 }
 
 function drawPoint(
-    ctx: CanvasRenderingContext2D,
-    xNorm: number,
-    yNorm: number,
-    w: number,
-    h: number,
-    r = 6
+  ctx: CanvasRenderingContext2D,
+  xNorm: number,
+  yNorm: number,
+  w: number,
+  h: number,
+  r = 5
 ) {
-    const x = xNorm * w;
-    const y = yNorm * h;
-    ctx.beginPath();
-    ctx.arc(x, y, r, 0, Math.PI * 2);
-    ctx.fill();
+  const x = xNorm * w;
+  const y = yNorm * h;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
 }
 
+// ---------- math helpers ----------
+type LM = { x: number; y: number; z?: number; visibility?: number };
+
+const rad2deg = (r: number) => (r * 180) / Math.PI;
+
+function mid(a: LM, b: LM): LM {
+  return {
+    x: (a.x + b.x) / 2,
+    y: (a.y + b.y) / 2,
+    z: a.z != null && b.z != null ? (a.z + b.z) / 2 : undefined,
+  };
+}
+
+function angleDeg(a: LM, b: LM) {
+  return rad2deg(Math.atan2(b.y - a.y, b.x - a.x));
+}
+
+function absDiff(a: number, b: number) {
+  return Math.abs(a - b);
+}
+
+function normalizeTo90(angle: number) {
+  let a = ((angle + 180) % 360) - 180; // (-180, 180]
+  if (a > 90) a -= 180;
+  if (a < -90) a += 180;
+  return a;
+}
+
+// ---------- main hook ----------
 export function useMonitoringEngine(
-    opts: Options = {}
+  opts: Options = {}
 ): MonitoringEngine & {
-    videoRef: React.RefObject<HTMLVideoElement | null>;
-    canvasRef: React.RefObject<HTMLCanvasElement | null>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
+  canvasRef: React.RefObject<HTMLCanvasElement | null>;
 } {
-    const { enableFace = true, fpsCap = 30, drawDebug = true } = opts;
+  const { enableFace = true, fpsCap = 30, drawDebug = true, mirror = true } = opts;
 
-    const videoRef = useRef<HTMLVideoElement>(null);
-    const canvasRef = useRef<HTMLCanvasElement>(null);
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
 
-    const streamRef = useRef<MediaStream | null>(null);
-    const poseRef = useRef<Awaited<ReturnType<typeof createPoseLandmarker>> | null>(null);
-    const faceRef = useRef<Awaited<ReturnType<typeof createFaceLandmarker>> | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const poseRef = useRef<Awaited<ReturnType<typeof createPoseLandmarker>> | null>(null);
+  const faceRef = useRef<Awaited<ReturnType<typeof createFaceLandmarker>> | null>(null);
 
-    const rafRef = useRef<number | null>(null);
-    const lastFrameTsRef = useRef<number>(0);
+  const rafRef = useRef<number | null>(null);
+  const lastFrameTsRef = useRef<number>(0);
 
-    // IMPORTANT: refs that the RAF loop reads (avoid stale React state closures)
-    const runningRef = useRef(false);
-    const pausedRef = useRef(false);
-    const fpsCapRef = useRef(fpsCap);
-    const enableFaceRef = useRef(enableFace);
+  // RAF reads refs (avoid stale closures)
+  const runningRef = useRef(false);
+  const pausedRef = useRef(false);
+  const fpsCapRef = useRef(fpsCap);
+  const enableFaceRef = useRef(enableFace);
+  const mirrorRef = useRef(mirror);
 
-    const [isRunning, setIsRunning] = useState(false);
-    const [isPaused, setIsPaused] = useState(false);
+  const [isRunning, setIsRunning] = useState(false);
+  const [isPaused, setIsPaused] = useState(false);
 
-    const [currentPostureState, setCurrentPostureState] = useState<PostureState>("no_person");
-    const [distanceSignal, setDistanceSignal] = useState<number | null>(null);
-    const [events, setEvents] = useState<MonitoringEvent[]>([]);
+  const [currentPostureState, setCurrentPostureState] = useState<PostureState>("no_person");
+  const [distanceSignal, setDistanceSignal] = useState<number | null>(null);
+  const [events, setEvents] = useState<MonitoringEvent[]>([]);
 
-    // For “too-close”: baseline learned in first ~2s
-    const baselineRef = useRef<number | null>(null);
-    const baselineSamplesRef = useRef<number[]>([]);
-    const lastAlertAtRef = useRef<number>(0);
-    const lastStateChangeAtRef = useRef<number>(0);
-    const stateRef = useRef<PostureState>("no_person");
+  // Face-distance baseline
+  const baselineFaceRef = useRef<number | null>(null);
+  const baselineFaceSamplesRef = useRef<number[]>([]);
 
-    // Debug logs
-    const didLogPoseOnceRef = useRef(false);
-    const didLogFaceOnceRef = useRef(false);
+  // Pose baselines (no hips)
+  const baselineShoulderXRef = useRef<number | null>(null);
+  const baselineNeckYRef = useRef<number | null>(null);
+  const baselinePoseSamplesRef = useRef<{ shoulderX: number; neckY: number }[]>([]);
 
-    // keep refs in sync if opts change
-    useEffect(() => {
-        fpsCapRef.current = fpsCap;
-    }, [fpsCap]);
+  const lastAlertAtRef = useRef<number>(0);
+  const lastStateChangeAtRef = useRef<number>(0);
+  const stateRef = useRef<PostureState>("no_person");
 
-    useEffect(() => {
-        enableFaceRef.current = enableFace;
-    }, [enableFace]);
+  const didLogPoseOnceRef = useRef(false);
+  const didLogFaceOnceRef = useRef(false);
 
-    const emit = useCallback((e: MonitoringEvent) => {
-        setEvents((prev) => [e, ...prev].slice(0, 200));
-    }, []);
+  useEffect(() => {
+    fpsCapRef.current = fpsCap;
+  }, [fpsCap]);
 
-    const clearOverlay = useCallback(() => {
-        const canvas = canvasRef.current;
-        if (!canvas) return;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) return;
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }, []);
+  useEffect(() => {
+    enableFaceRef.current = enableFace;
+  }, [enableFace]);
 
-    const stop = useCallback(() => {
-        runningRef.current = false;
-        pausedRef.current = false;
-        setIsRunning(false);
-        setIsPaused(false);
+  useEffect(() => {
+    mirrorRef.current = mirror;
+  }, [mirror]);
 
-        if (rafRef.current) cancelAnimationFrame(rafRef.current);
-        rafRef.current = null;
+  const emit = useCallback((e: MonitoringEvent) => {
+    setEvents((prev) => [e, ...prev].slice(0, 200));
+  }, []);
 
-        poseRef.current?.close();
-        faceRef.current?.close();
-        poseRef.current = null;
-        faceRef.current = null;
+  const clearOverlay = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+  }, []);
 
-        streamRef.current?.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
+  const stop = useCallback(() => {
+    runningRef.current = false;
+    pausedRef.current = false;
+    setIsRunning(false);
+    setIsPaused(false);
 
-        baselineRef.current = null;
-        baselineSamplesRef.current = [];
-        setDistanceSignal(null);
+    if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    rafRef.current = null;
+
+    poseRef.current?.close();
+    faceRef.current?.close();
+    poseRef.current = null;
+    faceRef.current = null;
+
+    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current = null;
+
+    baselineFaceRef.current = null;
+    baselineFaceSamplesRef.current = [];
+    baselineShoulderXRef.current = null;
+    baselineNeckYRef.current = null;
+    baselinePoseSamplesRef.current = [];
+
+    setDistanceSignal(null);
+    setCurrentPostureState("no_person");
+    stateRef.current = "no_person";
+
+    didLogPoseOnceRef.current = false;
+    didLogFaceOnceRef.current = false;
+
+    clearOverlay();
+  }, [clearOverlay]);
+
+  const pause = useCallback(() => {
+    pausedRef.current = !pausedRef.current;
+    setIsPaused(pausedRef.current);
+  }, []);
+
+  const TH = {
+    headRollDeg: 12,
+    headPitchDown: 0.060,
+    headPitchUp: 0.030,
+    shouldersUnevenY: 0.030,
+    shouldersDepthZ: 0.14,
+    forwardHeadZ: 0.18,
+    bodyLeanX: 0.050,
+    slouchNeckRatio: 0.75,
+    slouchNeckHardMin: 0.12,
+    tooCloseMul: 1.35,
+    tooFarMul: 0.75,
+  };
+
+  const loop = useCallback(() => {
+    rafRef.current = requestAnimationFrame(loop);
+    if (!runningRef.current || pausedRef.current) return;
+
+    const video = videoRef.current;
+    const pose = poseRef.current;
+    if (!video || !pose) return;
+
+    const now = performance.now();
+    const cap = fpsCapRef.current;
+    const minDelta = 1000 / cap;
+    if (now - lastFrameTsRef.current < minDelta) return;
+    lastFrameTsRef.current = now;
+
+    const poseRes: any = pose.detectForVideo(video, now);
+    const raw: LM[] | null =
+      poseRes.landmarks?.[0] ??
+      poseRes.poseLandmarks?.[0] ??
+      poseRes.worldLandmarks?.[0] ??
+      null;
+
+    if (!raw || raw.length < 13) {
+      if (stateRef.current !== "no_person") {
+        stateRef.current = "no_person";
         setCurrentPostureState("no_person");
+        emit({ type: "person_lost", ts: Date.now(), payload: {} });
+      }
+      if (drawDebug) clearOverlay();
+      return;
+    }
 
-        // reset debug flags
-        didLogPoseOnceRef.current = false;
-        didLogFaceOnceRef.current = false;
+    // ✅ Mirror landmarks to match mirrored preview (screen-left/screen-right)
+    const MIRROR = mirrorRef.current;
+    const lm = (i: number): LM => {
+      const p = raw[i];
+      return MIRROR ? { ...p, x: 1 - p.x } : p;
+    };
 
-        clearOverlay();
-    }, [clearOverlay]);
+    // Key points (head + shoulders only)
+    const nose = lm(0);
+    const lEye = lm(2);
+    const rEye = lm(5);
+    const lEar = lm(7);
+    const rEar = lm(8);
+    const ls = lm(11);
+    const rs = lm(12);
 
-    const pause = useCallback(() => {
-        pausedRef.current = !pausedRef.current;
-        setIsPaused(pausedRef.current);
-    }, []);
+    // Soft visibility gate only on shoulders
+    const visVals = [ls.visibility, rs.visibility].filter((v): v is number => typeof v === "number");
+    const minVis = visVals.length ? Math.min(...visVals) : 1;
+    if (minVis < 0.05) return;
 
-    const loop = useCallback(() => {
-        rafRef.current = requestAnimationFrame(loop);
+    const shoulderMid = mid(ls, rs);
+    const eyeMid = mid(lEye, rEye);
+    const earMid = mid(lEar, rEar);
 
-        if (!runningRef.current || pausedRef.current) return;
+    // Head roll
+    const rawRollDeg = angleDeg(lEar, rEar);
+    const rollDeg = normalizeTo90(rawRollDeg);
+    const headTiltLeft = rollDeg < -TH.headRollDeg;
+    const headTiltRight = rollDeg > TH.headRollDeg;
 
-        const video = videoRef.current;
-        const pose = poseRef.current;
-        if (!video || !pose) return;
+    // Head up/down
+    const noseEyeDeltaY = nose.y - eyeMid.y;
+    const headDown = noseEyeDeltaY > TH.headPitchDown;
+    const headUp = noseEyeDeltaY < TH.headPitchUp;
 
-        // throttle FPS
-        const now = performance.now();
-        const cap = fpsCapRef.current;
-        const minDelta = 1000 / cap;
-        if (now - lastFrameTsRef.current < minDelta) return;
-        lastFrameTsRef.current = now;
+    // Shoulder alignment
+    const shouldersUneven = absDiff(ls.y, rs.y) > TH.shouldersUnevenY;
+    const shouldersDepthMisaligned = Math.abs((ls.z ?? 0) - (rs.z ?? 0)) > TH.shouldersDepthZ;
 
-        // Detect pose
-        const poseRes: any = pose.detectForVideo(video, now);
+    // Back straight proxy (no hips)
+    const shoulderZ = shoulderMid.z ?? 0;
+    const noseZ = nose.z ?? 0;
+    const forwardHead = (shoulderZ - noseZ) > TH.forwardHeadZ;
 
-        // Some builds expose landmarks under different keys. Support both:
-        const poseLandmarks =
-            poseRes.landmarks?.[0] ??
-            poseRes.poseLandmarks?.[0] ??
-            poseRes.worldLandmarks?.[0] ??
-            null;
+    const neckY = nose.y - shoulderMid.y;
+    if (!baselineShoulderXRef.current || !baselineNeckYRef.current) {
+      baselinePoseSamplesRef.current.push({ shoulderX: shoulderMid.x, neckY });
+      if (baselinePoseSamplesRef.current.length >= 60) {
+        const avgX =
+          baselinePoseSamplesRef.current.reduce((a, s) => a + s.shoulderX, 0) /
+          baselinePoseSamplesRef.current.length;
+        const avgNeckY =
+          baselinePoseSamplesRef.current.reduce((a, s) => a + s.neckY, 0) /
+          baselinePoseSamplesRef.current.length;
+        baselineShoulderXRef.current = avgX;
+        baselineNeckYRef.current = avgNeckY;
+      }
+    }
 
-        if (!poseLandmarks || poseLandmarks.length < 13) {
-            if (stateRef.current !== "no_person") {
-                stateRef.current = "no_person";
-                setCurrentPostureState("no_person");
-                emit({ type: "person_lost", ts: Date.now(), payload: {} });
-            }
-            if (drawDebug) clearOverlay();
-            return;
+    const neckBaseline = baselineNeckYRef.current;
+    const slouchProxy =
+      (neckBaseline != null && neckY < neckBaseline * TH.slouchNeckRatio) ||
+      (neckBaseline == null && neckY < TH.slouchNeckHardMin);
+
+    // Body lean L/R (screen-based because we mirrored landmarks)
+    const baseX = baselineShoulderXRef.current;
+    const bodyOffsetX = baseX != null ? shoulderMid.x - baseX : shoulderMid.x - 0.5;
+    const isBodyLeaningLeft = bodyOffsetX < -TH.bodyLeanX;
+    const isBodyLeaningRight = bodyOffsetX > TH.bodyLeanX;
+
+    // Screen distance (face)
+    let tooClose = false;
+    let tooFar = false;
+    let faceArea: number | null = null;
+
+    if (enableFaceRef.current && faceRef.current) {
+      const faceRes: any = faceRef.current.detectForVideo(video, now);
+      const faceLandmarks = faceRes.faceLandmarks?.[0];
+      if (faceLandmarks?.length) {
+        faceArea = faceAreaSignal(faceLandmarks);
+        setDistanceSignal(faceArea);
+
+        if (!didLogFaceOnceRef.current) {
+          didLogFaceOnceRef.current = true;
+          console.log("[FACE] landmarks length:", faceLandmarks.length);
+          console.log("[FACE] faceAreaSignal:", faceArea);
         }
 
-        // Debug: verify once
-        if (!didLogPoseOnceRef.current) {
-            didLogPoseOnceRef.current = true;
-            console.log("[POSE] landmarks length:", poseLandmarks.length);
-            console.log("[POSE] nose (0):", poseLandmarks[0]);
-            console.log("[POSE] left shoulder (11):", poseLandmarks[11]);
-            console.log("[POSE] right shoulder (12):", poseLandmarks[12]);
-            console.log("[POSE] raw keys:", Object.keys(poseRes));
+        if (!baselineFaceRef.current) {
+          baselineFaceSamplesRef.current.push(faceArea);
+          if (baselineFaceSamplesRef.current.length >= 60) {
+            baselineFaceRef.current =
+              baselineFaceSamplesRef.current.reduce((a, b) => a + b, 0) /
+              baselineFaceSamplesRef.current.length;
+          }
+        } else {
+          const baseline = baselineFaceRef.current;
+          tooClose = faceArea > baseline * TH.tooCloseMul;
+          tooFar = faceArea < baseline * TH.tooFarMul;
         }
+      }
+    }
 
-        // Draw a minimal overlay so you can SEE it working immediately
-        if (drawDebug) {
-            const canvas = canvasRef.current;
-            if (canvas) {
-                ensureCanvasMatchesVideo(video, canvas);
-                const ctx = canvas.getContext("2d");
-                if (ctx) {
-                    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!didLogPoseOnceRef.current) {
+      didLogPoseOnceRef.current = true;
+      console.log("[POSE] rollDeg:", rollDeg.toFixed(2), "noseEyeDeltaY:", noseEyeDeltaY.toFixed(3));
+      console.log("[POSE] mirror:", MIRROR);
+    }
 
-                    // styles
-                    ctx.fillStyle = "rgba(0, 255, 0, 0.9)";
-                    ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
-                    ctx.lineWidth = 3;
+    // Decide state
+    let nextState: PostureState = "good";
+    if (tooClose) nextState = "too_close";
+    else if (tooFar) nextState = "too_far";
+    else if (isBodyLeaningLeft) nextState = "body_lean_left";
+    else if (isBodyLeaningRight) nextState = "body_lean_right";
+    else if (headTiltLeft) nextState = "head_tilt_left";
+    else if (headTiltRight) nextState = "head_tilt_right";
+    else if (headDown) nextState = "head_down";
+    else if (headUp) nextState = "head_up";
+    else if (shouldersUneven) nextState = "shoulders_unlevel";
+    else if (shouldersDepthMisaligned) nextState = "shoulders_depth_misaligned";
+    
+    if (nextState !== stateRef.current) {
+      stateRef.current = nextState;
+      lastStateChangeAtRef.current = now;
+      setCurrentPostureState(nextState);
+    }
 
-                    // Common pose indices (MediaPipe Pose)
-                    const nose = poseLandmarks[0];
-                    const ls = poseLandmarks[11];
-                    const rs = poseLandmarks[12];
-                    const le = poseLandmarks[13];
-                    const re = poseLandmarks[14];
-                    const lw = poseLandmarks[15];
-                    const rw = poseLandmarks[16];
-                    const lh = poseLandmarks[23];
-                    const rh = poseLandmarks[24];
-                    const lk = poseLandmarks[25];
-                    const rk = poseLandmarks[26];
-                    const la = poseLandmarks[27];
-                    const ra = poseLandmarks[28];
+    // Draw overlay (head + shoulders)
+    if (drawDebug) {
+      const canvas = canvasRef.current;
+      if (canvas) {
+        ensureCanvasMatchesVideo(video, canvas);
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          ctx.fillStyle = "rgba(0, 255, 0, 0.9)";
+          ctx.strokeStyle = "rgba(0, 255, 0, 0.8)";
+          ctx.lineWidth = 3;
 
-                    // Draw lines (skeleton connections)
-                    // torso + head
-                    drawLine(ctx, ls, rs, canvas.width, canvas.height);     // shoulders
-                    drawLine(ctx, ls, lh, canvas.width, canvas.height);     // left shoulder -> left hip
-                    drawLine(ctx, rs, rh, canvas.width, canvas.height);     // right shoulder -> right hip
-                    drawLine(ctx, lh, rh, canvas.width, canvas.height);     // hips
-                    drawLine(ctx, nose, ls, canvas.width, canvas.height);   // nose -> left shoulder
-                    drawLine(ctx, nose, rs, canvas.width, canvas.height);   // nose -> right shoulder
+          drawLine(ctx, ls, rs, canvas.width, canvas.height);
+          drawLine(ctx, lEar, rEar, canvas.width, canvas.height);
+          drawLine(ctx, lEye, rEye, canvas.width, canvas.height);
+          drawLine(ctx, nose, shoulderMid, canvas.width, canvas.height);
 
-                    // arms
-                    drawLine(ctx, ls, le, canvas.width, canvas.height);
-                    drawLine(ctx, le, lw, canvas.width, canvas.height);
-                    drawLine(ctx, rs, re, canvas.width, canvas.height);
-                    drawLine(ctx, re, rw, canvas.width, canvas.height);
+          const pts = [nose, lEye, rEye, lEar, rEar, ls, rs, shoulderMid, earMid, eyeMid];
+          for (const p of pts) drawPoint(ctx, p.x, p.y, canvas.width, canvas.height, p === nose ? 6 : 4);
 
-                    // legs
-                    drawLine(ctx, lh, lk, canvas.width, canvas.height);
-                    drawLine(ctx, lk, la, canvas.width, canvas.height);
-                    drawLine(ctx, rh, rk, canvas.width, canvas.height);
-                    drawLine(ctx, rk, ra, canvas.width, canvas.height);
-
-                    // Draw key points on top
-                    const pts = [nose, ls, rs, le, re, lw, rw, lh, rh, lk, rk, la, ra];
-                    for (const p of pts) {
-                        if (!p) continue;
-                        drawPoint(ctx, p.x, p.y, canvas.width, canvas.height, 5);
-                    }
-                }
-            }
+          ctx.font = "16px sans-serif";
+          ctx.fillText(`${nextState}`, 10, 20);
+          ctx.fillText(`mirror:${MIRROR}`, 10, 40);
         }
+      }
+    }
 
-        // 1) Lean
-        const lean = computeLeanState(poseLandmarks);
+    // Alerts
+    const BAD: PostureState[] = [
+      "too_close",
+      "too_far",
+      "body_lean_left",
+      "body_lean_right",
+      "head_tilt_left",
+      "head_tilt_right",
+      "head_down",
+      "head_up",
+      "shoulders_unlevel",
+      "shoulders_depth_misaligned",
+      "back_not_straight",
+    ];
 
-        // 2) Slouch
-        const slouch = computeSlouch(poseLandmarks);
+    const badPersistMs = 900;
+    const cooldownMs = 3500;
 
-        // 3) Optional Face signals
-        let tooClose = false;
-        let faceArea: number | null = null;
+    if (BAD.includes(stateRef.current)) {
+      const persisted = now - lastStateChangeAtRef.current >= badPersistMs;
+      const cooledDown = now - lastAlertAtRef.current >= cooldownMs;
 
-        if (enableFaceRef.current && faceRef.current) {
-            const faceRes = faceRef.current.detectForVideo(video, now);
-            const faceLandmarks = faceRes.faceLandmarks?.[0];
+      if (persisted && cooledDown) {
+        lastAlertAtRef.current = now;
 
-            if (faceLandmarks?.length) {
-                faceArea = faceAreaSignal(faceLandmarks);
-                setDistanceSignal(faceArea);
-
-                if (!didLogFaceOnceRef.current) {
-                    didLogFaceOnceRef.current = true;
-                    console.log("[FACE] landmarks length:", faceLandmarks.length);
-                    console.log("[FACE] faceAreaSignal:", faceArea);
-                }
-
-                // baseline from first ~60 frames
-                if (!baselineRef.current) {
-                    baselineSamplesRef.current.push(faceArea);
-                    if (baselineSamplesRef.current.length >= 60) {
-                        const avg =
-                            baselineSamplesRef.current.reduce((a, b) => a + b, 0) /
-                            baselineSamplesRef.current.length;
-                        baselineRef.current = avg;
-                        console.log("[FACE] baseline set:", baselineRef.current);
-                    }
-                } else {
-                    const baseline = baselineRef.current;
-                    tooClose = faceArea > baseline * 1.35;
-                }
-            }
-        }
-
-        // Decide final posture state (priority order)
-        let nextState: PostureState = "good";
-        if (tooClose) nextState = "too_close";
-        else if (slouch.isSlouch) nextState = "slouch";
-        else if (lean.state !== "good") nextState = lean.state;
-
-        // State change tracking
-        if (nextState !== stateRef.current) {
-            stateRef.current = nextState;
-            lastStateChangeAtRef.current = now;
-            setCurrentPostureState(nextState);
-            console.log("[STATE] ->", nextState);
-        }
-
-        // Alert policy: only alert if "bad" state persists, with cooldown
-        const BAD: PostureState[] = ["lean_left", "lean_right", "slouch", "too_close"];
-        const badPersistMs = 1200;
-        const cooldownMs = 5000;
-
-        if (BAD.includes(stateRef.current)) {
-            const persisted = now - lastStateChangeAtRef.current >= badPersistMs;
-            const cooledDown = now - lastAlertAtRef.current >= cooldownMs;
-
-            if (persisted && cooledDown) {
-                lastAlertAtRef.current = now;
-
-                emit({
-                    type: "posture_alert",
-                    ts: Date.now(),
-                    payload: { state: stateRef.current, score: slouch.score },
-                });
-
-                if (stateRef.current === "too_close" && baselineRef.current && faceArea != null) {
-                    emit({
-                        type: "distance_alert",
-                        ts: Date.now(),
-                        payload: { distanceSignal: faceArea, baseline: baselineRef.current },
-                    });
-                }
-            }
-        }
-    }, [clearOverlay, drawDebug, emit]);
-
-    const start = useCallback(async () => {
-        if (runningRef.current) return;
-
-        const video = videoRef.current;
-        if (!video) throw new Error("videoRef not attached");
-
-        // Camera
-        const stream = await navigator.mediaDevices.getUserMedia({
-            video: { width: { ideal: 1280 }, height: { ideal: 720 } },
-            audio: false,
+        emit({
+          type: "posture_alert",
+          ts: Date.now(),
+          payload: {
+            state: stateRef.current,
+            metrics: {
+              rollDeg,
+              noseEyeDeltaY,
+              shouldersYDiff: absDiff(ls.y, rs.y),
+              shouldersZDiff: Math.abs((ls.z ?? 0) - (rs.z ?? 0)),
+              forwardHead,
+              bodyOffsetX,
+              torsoFromVertical: bodyOffsetX,
+              faceArea,
+              baseline: baselineFaceRef.current,
+            },
+            flags: {
+              headTiltLeft,
+              headTiltRight,
+              headDown,
+              headUp,
+              shouldersUneven,
+              shouldersDepthMisaligned,
+              forwardHead,
+              slouch: slouchProxy,
+              isBodyLeaningLeft,
+              isBodyLeaningRight,
+              tooClose,
+              tooFar,
+            },
+          },
         });
 
-        streamRef.current = stream;
-        video.srcObject = stream;
+        if ((tooClose || tooFar) && baselineFaceRef.current && faceArea != null) {
+          emit({
+            type: "distance_alert",
+            ts: Date.now(),
+            payload: { distanceSignal: faceArea, baseline: baselineFaceRef.current, tooClose, tooFar },
+          });
+        }
+      }
+    }
+  }, [clearOverlay, drawDebug, emit]);
 
-        // Recommended attributes for iOS / Safari stability
-        video.playsInline = true;
-        video.muted = true;
+  const start = useCallback(async () => {
+    if (runningRef.current) return;
 
-        await video.play();
+    const video = videoRef.current;
+    if (!video) throw new Error("videoRef not attached");
 
-        // Load models
-        poseRef.current = await createPoseLandmarker();
-        if (enableFaceRef.current) faceRef.current = await createFaceLandmarker();
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 1280 }, height: { ideal: 720 } },
+      audio: false,
+    });
 
-        // Start loop
-        runningRef.current = true;
-        pausedRef.current = false;
-        setIsRunning(true);
-        setIsPaused(false);
-        lastFrameTsRef.current = 0;
+    streamRef.current = stream;
+    video.srcObject = stream;
+    video.playsInline = true;
+    video.muted = true;
 
-        // reset debug flags each start
-        didLogPoseOnceRef.current = false;
-        didLogFaceOnceRef.current = false;
+    await video.play();
 
-        rafRef.current = requestAnimationFrame(loop);
-    }, [loop]);
+    poseRef.current = await createPoseLandmarker();
+    if (enableFaceRef.current) faceRef.current = await createFaceLandmarker();
 
-    useEffect(() => stop, [stop]);
+    runningRef.current = true;
+    pausedRef.current = false;
+    setIsRunning(true);
+    setIsPaused(false);
 
-    return {
-        start,
-        stop,
-        pause,
-        isRunning,
-        isPaused,
-        currentPostureState,
-        distanceSignal,
-        events,
-        videoRef,
-        canvasRef,
-    };
+    lastFrameTsRef.current = 0;
+    didLogPoseOnceRef.current = false;
+    didLogFaceOnceRef.current = false;
+
+    baselineFaceRef.current = null;
+    baselineFaceSamplesRef.current = [];
+    baselineShoulderXRef.current = null;
+    baselineNeckYRef.current = null;
+    baselinePoseSamplesRef.current = [];
+
+    rafRef.current = requestAnimationFrame(loop);
+  }, [loop]);
+
+  useEffect(() => stop, [stop]);
+
+  return {
+    start,
+    stop,
+    pause,
+    isRunning,
+    isPaused,
+    currentPostureState,
+    distanceSignal,
+    events,
+    videoRef,
+    canvasRef,
+  };
 }

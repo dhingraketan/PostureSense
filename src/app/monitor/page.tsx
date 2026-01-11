@@ -30,11 +30,8 @@ export default function MonitorPage() {
 
       {/* ✅ Put the overlay block RIGHT HERE */}
       <div className="relative w-full max-w-3xl">
-        <video ref={engine.videoRef} className="w-full rounded border" playsInline />
-        <canvas
-          ref={engine.canvasRef}
-          className="absolute inset-0 w-full h-full pointer-events-none"
-        />
+        <video ref={engine.videoRef} className="w-full rounded border -scale-x-100" />
+        <canvas ref={engine.canvasRef} className="absolute inset-0 w-full h-full pointer-events-none" />
       </div>
     </div>
   );

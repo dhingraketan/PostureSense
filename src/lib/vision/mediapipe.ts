@@ -34,5 +34,6 @@ export async function createFaceLandmarker() {
     runningMode: "VIDEO",
     numFaces: 1,
     outputFaceBlendshapes: true,
+    outputFacialTransformationMatrixes: true,
   });
 }
