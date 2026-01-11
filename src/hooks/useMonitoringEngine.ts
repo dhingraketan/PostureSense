@@ -126,6 +126,7 @@ export function useMonitoringEngine(
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const lastPostureAlertAtRef = useRef<number>(0);
 
   const streamRef = useRef<MediaStream | null>(null);
   const poseRef = useRef<Awaited<ReturnType<typeof createPoseLandmarker>> | null>(null);
@@ -188,11 +189,12 @@ export function useMonitoringEngine(
   const didLogFaceOnceRef = useRef(false);
 
   // ---------------- Coach layer refs ----------------
+  // ✅ DEMO: 15s window + 15s cooldown
   const coach = {
-    windowMs: 120_000, // 2 minutes
-    badDominanceMs: 90_000, // bad for >= 90s within the 2-min bucket -> remind at bucket end
-    continuousBadMs: 120_000, // same issue continuously for 2 min -> immediate remind
-    cooldownMs: 360_000, // 6 minutes no spam
+    windowMs: 15_000,          // was 120_000
+    badDominanceMs: 10_000,    // was 90_000
+    continuousBadMs: 15_000,   // was 120_000
+    cooldownMs: 15_000,        // was 360_000
   };
 
   const coachLastTickRef = useRef<number | null>(null);
@@ -270,6 +272,7 @@ export function useMonitoringEngine(
     coachStateMsRef.current.clear();
     coachContinuousMsRef.current.clear();
     coachLastReminderAtRef.current = 0;
+    lastPostureAlertAtRef.current = 0; // ✅ add
 
     clearOverlay();
   }, [clearOverlay]);
@@ -296,8 +299,9 @@ export function useMonitoringEngine(
 
   // stability filter params
   const STABLE = {
-    persistMs: 450, // must remain true this long to become active
-    clearMs: 650, // must remain false this long to clear
+    persistMs: 450,
+    clearMs: 650,
+    alertCooldownMs: 15000, // ✅ 15s (was 3500)
   };
 
   function updateStableIssues(now: number, candidates: Issue[]) {
@@ -657,6 +661,21 @@ export function useMonitoringEngine(
 
     // ✅ Coach layer (2-min reminders, no spam)
     coachTick(now, newActives, primary, metrics, flags);
+    const postureCooledDown = now - lastPostureAlertAtRef.current >= STABLE.alertCooldownMs;
+
+    if (newActives.length > 0 && postureCooledDown) {
+      lastPostureAlertAtRef.current = now;
+
+      emit({
+        type: "posture_alert",
+        ts: Date.now(),
+        payload: {
+          state: primary,
+          metrics,
+          flags,
+        },
+      });
+    }
 
     // ----- Draw overlay -----
     if (drawDebug) {
@@ -736,6 +755,7 @@ export function useMonitoringEngine(
     coachStateMsRef.current.clear();
     coachContinuousMsRef.current.clear();
     coachLastReminderAtRef.current = 0;
+    lastPostureAlertAtRef.current = 0; // ✅ add
 
     rafRef.current = requestAnimationFrame(loop);
   }, [loop]);

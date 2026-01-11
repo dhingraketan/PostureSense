@@ -93,7 +93,7 @@ export function useCoachNotifier(engine: MonitoringEngine) {
 
     toast(title, {
       description: body,
-      duration: 7000,
+      duration: 15000, // ✅ 15s (was 7000)
     });
 
     showBrowserNotification(title, body);
