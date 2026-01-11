@@ -4,7 +4,7 @@ import { ThemeProvider } from "next-themes";
 import TopNav from "@/components/TopNav";
 
 export const metadata: Metadata = {
-  title: "Posture Coach",
+  title: "PostureSense",
   description: "Posture + focus + reminders + AI coaching",
 };
 

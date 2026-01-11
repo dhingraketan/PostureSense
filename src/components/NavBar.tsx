@@ -17,7 +17,7 @@ export function NavBar() {
     <div className="border-b">
       <div className="max-w-5xl mx-auto px-6 h-14 flex items-center gap-4">
         <Link href="/" className="font-semibold">
-          Posture Coach
+          PostureSense
         </Link>
 
         <nav className="ml-auto flex gap-2">

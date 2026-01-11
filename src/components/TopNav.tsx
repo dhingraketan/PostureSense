@@ -35,7 +35,7 @@ export default function TopNav() {
     <header className="sticky top-0 z-50 border-b border-border bg-background/70 backdrop-blur">
       <div className="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
-          <div className="font-semibold tracking-tight">Posture Coach</div>
+          <div className="font-semibold tracking-tight">PostureSense</div>
           <span className="hidden sm:inline text-xs text-muted-foreground">
             posture · focus · reminders · AI
           </span>
